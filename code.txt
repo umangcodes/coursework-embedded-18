@@ -1,0 +1,688 @@
+//=============================================================
+//=============================================================
+//HEADER FILES
+#include "pragmas.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <delays.h>
+#include <p18f45k22.h>
+#include <usart.h>
+
+//----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+//=============================================================
+//=============================================================
+//PREPROCESSORS
+
+
+//hardware
+#define EWBUTTON PORTDbits.RD1
+#define NSBUTTON PORTDbits.RD0
+
+//general
+#define TRUE 1
+#define FALSE 0
+
+//receive interrupt flag and enable
+#define RC2FLAG PIR3bits.RC2IF
+#define RC2ENABLE PIE3bits.RC2IE
+
+//global and peripheral interrupt enable
+#define GLOBALINT INTCONbits.GIE
+#define PERIPHERALINT INTCONbits.PEIE
+
+//oscillator stable flag
+#define OSCILLATORSTABLE OSCCONbits.HFIOFS
+
+//command from mbed to pic
+#define CONTROLLER 1
+#define MYADDRESS 663
+#define NOOFPOINTERS 10
+
+
+//ADC module
+#define MAXSAMPLES 3
+#define ADCVOLT 5
+#define ADCBITS 1024
+#define ADCRES (ADCVOLT/ADCBITS)
+#define ADCGO ADCON0bits.GO
+#define ADCSTART ADCON0bits.ADON
+
+//command from pic to pc
+#define MESSAGESIZE 30
+
+//timer 0 flag
+#define TIMERFLAG INTCONbits.TMR0IF
+
+//timer
+#define TIMES 5
+
+//pragma for interrupt
+#pragma interrupt ISR
+void ISR(void);
+
+#pragma code interrupt_vector = 0x008
+void interrupt_vector(void)
+{
+	_asm
+	goto ISR
+	_endasm
+}
+#pragma code
+
+
+
+//----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+//=============================================================
+//=============================================================
+//GLOBAL VARIABLES
+
+
+char dataToMbed[MESSAGESIZE];
+//associated with interrupts
+char commandFromControllerG[30];
+char retainCommand[30];							//for retaining data from controller
+char sentenceReadyG = 0;
+char*ptr = commandFromControllerG;
+char*elementG[NOOFPOINTERS];
+char commandG[] = {"MODCHG\0"};
+int checksumG = 0;
+char modeG = 0;
+
+char clrScr[] = "\033[2J\033[H";
+
+
+//associated with lab2
+char buttonPressedG = 0;
+char samplesInitializedG = 0;
+char arrayInitializedG = 0;
+char commandDisplayG = 0;
+char bufferG[MESSAGESIZE];
+
+int sampleG = 0;
+int finalTemperatureG = 0;
+int timeG = 0;
+int controllerAddress = CONTROLLER;
+//int checksumG = 0;					//used during data packaging
+
+float sumG = 0;
+float adcSampleG = 0;
+float temperatureG = 0;
+ 
+
+char countG = 0;
+char indexG = 0;
+char secondsG = 0;
+int time[] = {5,10,5,5,10,5};
+char commandDisplay = 0;
+
+
+char newCommand = 0;
+char printCommand = 0;
+//----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+//=============================================================
+//=============================================================
+//prototypes
+
+void systemSetup(void);
+void collectSentence();
+
+//data handling
+char checksum(char*command);
+char validate(char*command);
+void parseSentence(char*commandA);
+void executeCommand(void);
+
+//adc
+void adcSetupAndStart(void);
+int adcConversion(void);
+int getTemperature(void);
+int ambientTemperature(void);
+
+//data structure
+void dataStructureSetup(void);
+
+
+//communication
+void printData(void);
+void commandBufferSetup(void);
+void checkForNewCommand();
+void puts2USART(char*data);
+//----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+//==============================================================
+//==============================================================
+//FUNCTIONS
+
+
+
+
+
+//----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+//==============================================================
+//==============================================================
+//CHECKSUM FUNCTION
+char checksum(char*commandB)
+{
+	checksumG = 0;
+	while(*commandB)
+	{
+		checksumG ^= *commandB;
+		commandB++;
+	}
+	return checksumG;
+}
+
+
+
+//==============================================================
+//==============================================================
+//COLLECTSENTENCE FUNCTION
+
+void collectSentence()
+{
+	char hold = 0;
+	if(RC2FLAG)
+	{
+		hold = RC2REG;
+		if(hold == '$')
+		{
+			ptr = commandFromControllerG;
+		}
+		if(hold == '#')
+		{
+			sentenceReadyG = TRUE;
+			*(ptr+1) = '\0';
+		}
+		*ptr = hold;
+		ptr++;
+	}
+}
+
+//==============================================================
+//==============================================================
+//VALIDATE FUNCTION
+
+char validate(char*command)
+{
+	int recCs = 0;
+	int newCs = 0;
+	char checksumFlag = 0;
+	unsigned char count = strlen(command);
+	
+	while(!checksumFlag)
+	{
+		if(*(command+count) == '#')
+		{
+			*(command+count) = 0x00;
+		}
+		if(*(command+count) == ',')
+		{
+			*(command+count) = 0x00;
+			recCs = atoi(command+count+1);
+			checksumFlag = TRUE;
+		}
+		count--;
+	}
+	newCs = checksum(command);
+	if(newCs == recCs)
+	{
+		//printf("valid");
+		return TRUE;
+	}
+	else
+	{
+		//printf("invalid");
+		return FALSE;
+	}
+	
+}
+		
+
+
+//==============================================================
+//==============================================================
+//PARSE FUNCTION
+
+void parseSentence(char*commandA)
+{
+	int index = 0;
+	int counter = 0;
+	
+	for(index;index<NOOFPOINTERS;index++)
+	{
+		elementG[index] = 0;
+	}
+	while(*commandA)
+	{
+		if(*commandA == '$'||*commandA == ',' )
+		{
+			*commandA = '\0';
+			elementG[counter] = commandA+1;
+			counter++;
+		}
+		commandA++;
+	}
+}
+
+
+//==============================================================
+//==============================================================
+//EXECUTESENTENCE FUNCTION
+
+void executeSentence(void)
+{
+	if(MYADDRESS == atoi(elementG[1]))
+	{
+		if(CONTROLLER == atoi(elementG[2]))
+		{
+			if(strcmp(elementG[0],commandG) == 0)
+			{
+				modeG = atoi(elementG[3]);
+				newCommand = 1;
+				printCommand = 1;
+			}
+		}
+	}
+}
+//==============================================================
+//==============================================================
+//CHECK FOR NEW COMMAND
+
+void checkForNewCommand()
+{
+	strcpy(retainCommand,commandFromControllerG);
+	if(sentenceReadyG)
+	{
+		sentenceReadyG = FALSE;
+		if(validate(commandFromControllerG))
+		{
+			parseSentence(commandFromControllerG);
+			executeSentence();
+		}
+	}
+	/*printf("\n\n\r\t NEW COMMAND RECEIVED\n\n\r\t%s",retainCommand);
+	
+*/
+}
+//----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+//==============================================================
+//==============================================================
+//ADC SETUP AND START
+
+void adcSetupAndStart(void)
+{
+	ADCON2 = 0xA9;
+	ADCON1 = 0x00;
+	ADCSTART = TRUE;
+	//micro seconds delay
+}
+
+
+//==============================================================
+//==============================================================
+//ADC CONVERSION
+int adcConversion(void)
+{
+	ADCGO = TRUE;
+	while(ADCGO);
+	sampleG = ADRESH;
+	sampleG << 8;
+	sampleG |= ADRESL;
+	ADCSTART = FALSE;
+	return sampleG;
+}
+
+
+//==============================================================
+//==============================================================
+//GET TEMPERATURE
+int getTemperature(void)
+{
+	ADCON2 |= 0x49;
+	ADCON1 |= 0x00;
+	ADCSTART = TRUE;
+	//micro seconds delay
+	ADCGO = TRUE;
+	while(ADCGO);
+	sampleG = ADRESH;
+	sampleG << 8;
+	sampleG |= ADRESL;
+	ADCSTART = FALSE;
+	adcSampleG = 0;
+	sampleG = sampleG*5;
+	adcSampleG = (float) sampleG/1024;
+	adcSampleG = (adcSampleG-1.8)/0.028;
+	sampleG = adcSampleG;
+	return sampleG;
+}
+
+//----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+//==============================================================
+//==============================================================
+//DATA STRUCTURE
+
+typedef struct itcSystem
+{
+	int address;
+	int avgSample;
+	int samples[MAXSAMPLES];
+	char insertpoint;
+	char mode;
+	char statusNS;
+	char statusEW;
+} itcSys_t;
+itcSys_t itc663;
+
+//==============================================================
+//==============================================================
+//DATA STRUCTURE SETUP
+
+void dataStructureSetup(void)
+{
+	itc663.address = 663;
+	itc663.avgSample = 0;
+	for(countG;countG<MAXSAMPLES;countG++)
+	{
+		itc663.samples[countG] = 0;
+	}
+	countG = 0;
+	itc663.insertpoint = 0;
+	itc663.mode = 0;
+	itc663.statusNS = 'R';
+	itc663.statusEW = 'R';
+}
+
+//==============================================================
+//==============================================================
+//COMMAND BUFFER SETUP
+
+void commandBufferSetup()
+{
+	char count = 0;
+	for(count;count<MAXSAMPLES;count++)
+	{
+		bufferG[count] = 0;
+	}
+}
+
+void interruptSetup(void)
+{
+	GLOBALINT = TRUE;
+	PERIPHERALINT = TRUE;
+	RC2ENABLE = TRUE;
+}
+//==============================================================
+//==============================================================
+//SYSTEMSETUP
+
+void systemSetup(void)
+{
+	OSCCON = 0x52;
+	OSCCON2 = 0x00;
+	OSCTUNE = 0x00;
+	while(!OSCILLATORSTABLE);
+	
+	TXSTA1 = 0x26;
+	RCSTA1 = 0x80;
+	BAUDCON1 = 0x40;
+	SPBRG1 = 25;
+	TRISC = 0xC0;
+	ANSELC = 0x00;
+	
+	TXSTA2 = 0x26;
+	RCSTA2 = 0x90;
+	BAUDCON2 = 0x40;
+	SPBRG2 = 12;
+	TRISD = 0xCF;
+	ANSELD = 0x00;
+	
+	ANSELA = 0x01;
+	LATA = 0x00;
+	TRISA = 0x01;
+	ANSELB = 0x00;
+	LATB = 0x00;
+	TRISB = 0x00;
+	//TRISD = 0xc3;
+
+	dataStructureSetup();
+	commandBufferSetup();
+	interruptSetup();
+}
+
+
+//==============================================================
+//==============================================================
+//AMBIENT TEMPERATURE
+int ambientTemperature(void)
+{
+	itc663.samples[itc663.insertpoint] = getTemperature();
+	itc663.insertpoint++;
+	if(itc663.insertpoint == MAXSAMPLES)
+	{
+		itc663.insertpoint = 0;
+		arrayInitializedG = TRUE;
+	}
+	indexG = 0;
+	sumG = 0;
+	for(indexG;indexG<MAXSAMPLES;indexG++)
+	{
+		sumG = sumG + itc663.samples[indexG];
+	}
+	indexG = 0;
+	sumG = sumG/3;
+	return sumG;
+}
+
+//==============================================================
+//==============================================================
+//PRINT DATA
+
+void printData()
+{
+	printf("%s",clrScr);
+	sprintf(bufferG,"$MODCHG,%d,%d,%d",itc663.address,controllerAddress,itc663.mode);
+	sprintf(bufferG,"%s,%d#",bufferG,checksum(bufferG));
+	if(secondsG <= 2)
+	{
+		printf("current status: %s",bufferG);
+			
+	}
+	
+	if(printCommand == 1 && secondsG <= 5)
+	{
+		printf("\n\r\t newCommand: %s",(retainCommand+1));
+			
+	}
+
+	printf("\n\rNS = %c \t\t EW = %c",itc663.statusNS,itc663.statusEW);
+
+	if(!arrayInitializedG)
+	{
+		printf("\t\tFetching \n\r");
+	}
+	else if(arrayInitializedG)
+	{
+		printf("\t\t Temperature: %d%cC",itc663.avgSample,248);
+	}
+}	
+
+
+
+void checkButton()
+{
+	if(itc663.mode == 1)
+	{
+		itc663.statusNS = 'G';
+		itc663.statusEW = 'R';
+		itc663.avgSample = sumG;
+		if(!NSBUTTON)
+		{
+			buttonPressedG = 1;	
+		}
+		if(!buttonPressedG)
+		{
+			LATA = 0x90;
+		}
+		else if(buttonPressedG)
+		{
+			if(secondsG%2 == 0)
+			{
+				LATA = 0xA0;
+			}
+			else if(secondsG%2 == 1)
+			{
+				LATA = 0x80;
+			}
+		}
+	}
+	
+
+	if(itc663.mode == 4)
+	{
+		itc663.statusNS = 'G';
+		itc663.statusEW = 'R';
+		itc663.avgSample = sumG;
+		if(EWBUTTON == 0)	//0b0000 0010
+		{
+			buttonPressedG = 1;	
+		}
+		if(buttonPressedG == 0)
+		{
+			LATA = 0x60;
+		}
+		else if( buttonPressedG == 1)
+		{
+			if(secondsG%2 == 0)
+			{
+				LATA = 0xA0;
+			}
+			else if(secondsG%2 == 1)
+			{
+				LATA = 0x20;
+			}
+		}
+	}
+}
+//----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+//==============================================================
+//==============================================================
+//MODE FUNCTION
+void mode()
+{
+	switch(itc663.mode)
+	{
+		case 0:
+			LATA = 0xA0;
+			LATB = 0x09;
+			itc663.statusEW = 'R';
+			itc663.statusNS = 'R';
+			break;
+		case 1:						
+			LATB = 0x0C;
+			checkButton();
+			break;
+		case 2:
+			LATA = 0xA0;
+			LATB = 0x0A;
+			itc663.statusEW = 'R';
+			itc663.statusNS = 'R';
+			break;
+		case 3:
+			LATA = 0xA0;
+			LATB = 0x09;
+			itc663.statusEW = 'R';
+			itc663.statusNS = 'R';
+			break;
+		case 4:						//
+			LATB = 0x21;
+			checkButton();
+			break;
+		case 5:
+			LATA = 0xA0;
+			LATB = 0x11;
+			itc663.statusEW = 'R';
+			itc663.statusNS = 'R';
+			break;
+	}
+}
+
+void resetTimer()
+{
+	TMR0H = 0x0B;
+	TMR0L = 0xDC;
+	TIMERFLAG = FALSE;
+	T0CON = 0x93;
+}
+
+void checkTimer()
+{
+	if(TIMERFLAG)
+	{
+		printData();
+		secondsG++;
+		resetTimer();		//NO FUNCTION PROTOTYPE INCLUDED CHECK SOON!!::
+		if(secondsG>= 3)
+		{
+			commandDisplay = 0;
+		}
+		if(secondsG == time[itc663.mode])
+		{
+			commandDisplay = 1;
+			printCommand = 0;
+			secondsG = 0;
+			if(!newCommand)
+			{
+				itc663.mode++;
+				sprintf(dataToMbed,"$MODUPD,%i,%i,%i",CONTROLLER,MYADDRESS,itc663.mode);
+				sprintf(dataToMbed,"%s,%i#",dataToMbed,checksum(dataToMbed));
+				puts2USART(dataToMbed);
+				if(itc663.mode >= TIMES)
+				{
+					itc663.mode = 0;
+					buttonPressedG = 0;
+				}
+			}
+			if(newCommand)
+			{
+				itc663.mode = modeG;
+				sprintf(dataToMbed,"$MODUPD,%i,%i,%i",CONTROLLER,MYADDRESS,itc663.mode);
+				sprintf(dataToMbed,"%s,%i#",dataToMbed,checksum(dataToMbed));
+				puts2USART(dataToMbed);
+				modeG = 6;
+				newCommand = 0;
+				commandDisplayG = 0;
+			}
+		}
+	}
+}
+
+//----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+//==============================================================
+//==============================================================
+//ISR FUNCTION
+#pragma interrupt ISR
+void ISR(void)
+{
+	if(RC2FLAG)
+	{
+		//RC2ENABLE = FALSE;
+		collectSentence();
+		
+		//RC2ENABLE = TRUE;
+	}
+	INTCON |= 0xC0;
+}
+void main()
+{
+	systemSetup();
+	resetTimer();
+	while(1)
+	{
+		checkTimer();
+		checkForNewCommand();
+		mode();
+		sumG = ambientTemperature();
+		itc663.avgSample = sumG;
+	}
+	
+}
